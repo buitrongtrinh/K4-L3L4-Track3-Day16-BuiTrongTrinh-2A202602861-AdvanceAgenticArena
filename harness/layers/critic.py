@@ -70,7 +70,45 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._text import claim_text, in_one_line, norm
 from harness.middleware import Middleware
+
+#: Các chỗ mô hình hay dán hai nửa câu vào nhau.
+_SEAMS = (" và ", " nhưng ", " trong khi ", " còn ", "; ", ", ")
+
+ABSTAIN_ANSWER = (
+    "Không đủ căn cứ trong các tài liệu đã đọc để trả lời chắc chắn câu hỏi này."
+)
+
+
+def _owner(ctx, text):
+    """doc_id của tài liệu (đã đọc) chứa `text` trong một dòng, hoặc None."""
+    if ctx.corpus is None:
+        return None
+    hits = [d for d in ctx.corpus.docs if in_one_line(d, text)]
+    full = [d for d in hits if norm(d.body) in norm(ctx.observed_text)]
+    chosen = full or hits
+    return chosen[0].doc_id if chosen else None
+
+
+def _split(ctx, text):
+    """Cắt câu ghép tại chỗ dán: hai nửa đều là chữ thật, thuộc hai tài liệu khác nhau."""
+    for seam in _SEAMS:
+        start = 0
+        while True:
+            at = text.find(seam, start)
+            if at < 0:
+                break
+            start = at + 1
+            left, right = text[:at].strip(), text[at + len(seam):].strip()
+            if len(left) < 12 or len(right) < 12:
+                continue
+            if not (ctx.saw(left) and ctx.saw(right)):
+                continue
+            a, b = _owner(ctx, left), _owner(ctx, right)
+            if a and b and a != b:
+                return [{"text": left, "doc_id": a}, {"text": right, "doc_id": b}]
+    return None
 
 
 class Critic(Middleware):
@@ -79,16 +117,30 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+        observed = norm(ctx.observed_text)
+        kept, spliced = [], False
+        for claim in claims:
+            text = claim_text(claim)
+            if text and norm(text) in observed:
+                kept.append(claim)
+                continue
+            halves = _split(ctx, text) if text else None
+            if halves:
+                kept.extend(halves)
+                spliced = True
+            # không tách được -> bịa -> bỏ claim
+        report["claims"] = kept
+        if spliced:
+            report["abstain"] = True  # hai nguồn mâu thuẫn: nêu cả hai phía rồi từ chối kết luận
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = ABSTAIN_ANSWER
+        else:
+            report["citations"] = sorted(
+                {c["doc_id"] for c in kept if isinstance(c, dict) and c.get("doc_id")}
+            )
+        return report

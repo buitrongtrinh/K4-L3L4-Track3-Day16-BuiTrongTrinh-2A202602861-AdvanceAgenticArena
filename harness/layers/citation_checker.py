@@ -59,6 +59,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._text import claim_text, in_one_line, norm
 from harness.middleware import Middleware
 
 
@@ -68,16 +69,26 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+        observed = norm(ctx.observed_text)
+        for claim in claims:
+            text = claim_text(claim)
+            if not text or not isinstance(claim.get("doc_id"), str):
+                continue
+            cited = ctx.corpus.get(claim["doc_id"])
+            if cited is not None and in_one_line(cited, text):
+                continue
+            # Ưu tiên tài liệu đã về nguyên vẹn; nếu không có thì tài liệu
+            # có dòng chứa câu và câu đó đã thật sự nằm trong quan sát.
+            hits = [d for d in ctx.corpus.docs if in_one_line(d, text)]
+            full = [d for d in hits if norm(d.body) in observed]
+            seen = [d for d in hits if norm(text) in observed]
+            source = (full or seen or [None])[0]
+            if source is not None:
+                claim["doc_id"] = source.doc_id
+        report["citations"] = sorted(
+            {c["doc_id"] for c in claims if isinstance(c, dict) and c.get("doc_id")}
+        )
+        return report
